@@ -73,6 +73,47 @@ blueprint:
             number:
               min: 1
               max: 60
+    # ─────────────────────────────────────────
+    # Arlo / aarlo snapshot handling
+    # ─────────────────────────────────────────
+    arlo_section:
+      name: Specific Arlo settings
+      description: Settings to deal with Arlo details
+      icon: mdi:camera
+      input:
+        arlo_snapshot_refresh:
+          name: aarlo - Request snapshot before analysis
+          default: true
+          selector:
+            boolean: {}
+
+        arlo_delay_seconds:
+          name: aarlo - Delay after snapshot request
+          description: Time to wait for Arlo cloud thumbnail to refresh
+          default: 7
+          selector:
+            number:
+              min: 0
+              max: 20
+              unit_of_measurement: s
+
+        arlo_wait_thumbnail_change:
+          name: aarlo - Wait for last_thumbnail to change
+          default: true
+          selector:
+            boolean: {}
+
+        arlo_wait_timeout_seconds:
+          name: aarlo - Max wait for thumbnail change
+          default: 12
+          selector:
+            number:
+              min: 0
+              max: 30
+              unit_of_measurement: s
+    # ─────────────────────────────────────────
+    # End of Arlo / aarlo snapshot handling
+    # ─────────────────────────────────────────
     # AI Section
     ai_section:
       name: AI Settings
@@ -481,6 +522,33 @@ variables:
   snapshot_access_file_path: '{{ file_path | replace(''/config/www'',
     ''/local'') | replace(''/media'', ''/media/local'') }}'
   notification_time: !input notification_time
+  # ─────────────────────────────────────────
+  # Arlo / aarlo variables
+  # ─────────────────────────────────────────
+  arlo_snapshot_refresh: !input arlo_snapshot_refresh
+  arlo_delay_seconds: !input arlo_delay_seconds
+  arlo_wait_thumbnail_change: !input arlo_wait_thumbnail_change
+  arlo_wait_timeout_seconds: !input arlo_wait_timeout_seconds
+
+  _is_aarlo: >
+    {{ camera_entity.startswith('camera.aarlo_')
+        or (state_attr(camera_entity,'attribution')|default('')|lower).find('arlo') != -1 }}
+
+  # Build two snapshot file paths next to your existing file_path location
+  _snap_dir: >
+    {{ (file_path | string).rsplit('/', 1)[0] }}
+  snap1_path: >
+    {{ _snap_dir ~ '/snap1.jpg' }}
+  snap2_path: >
+    {{ _snap_dir ~ '/snap2.jpg' }}
+
+  snap1_access_path: >
+    {{ snap1_path | replace('/config/www','/local') | replace('/media','/media/local') }}
+  snap2_access_path: >
+    {{ snap2_path | replace('/config/www','/local') | replace('/media','/media/local') }}
+  # ─────────────────────────────────────────
+  # End of Arlo / aarlo variables
+  # ─────────────────────────────────────────
 
 max_exceeded: silent
 mode: single
@@ -618,23 +686,126 @@ action:
                                   ttl: 0
                                   priority: high
 
-  - alias: "Analyze event"
-    action: llmvision.stream_analyzer
-    data:
-      image_entity: "{{[camera_entity]}}"
-      duration: !input duration
-      provider: !input provider
-      model: !input model
-      message: !input message
-      use_memory: !input use_memory
-      remember: !input remember
-      expose_images: "{{preview_mode == 'Snapshot' or remember}}"
-      generate_title: !input remember
-      include_filename: true
-      max_frames: !input max_frames
-      target_width: !input target_width
-      max_tokens: !input max_tokens
-    response_variable: response
+  # ─────────────────────────────────────────
+  # Analyze event
+  #   - Arlo: take 2 refreshed snapshots and send both to image_analyzer
+  #   - Others: keep stream_analyzer
+  # ─────────────────────────────────────────
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ _is_aarlo }}"
+        sequence:
+          - variables:
+              _thumb_before: "{{ state_attr(camera_entity, 'last_thumbnail') | default('') }}"
+
+          # Request snapshot (Arlo cloud refresh)
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ arlo_snapshot_refresh }}"
+                sequence:
+                  - service: aarlo.camera_request_snapshot
+                    target:
+                      entity_id: "{{ camera_entity }}"
+
+          - delay:
+              seconds: "{{ arlo_delay_seconds | int }}"
+
+          # Optional: wait for thumbnail to change
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ arlo_wait_thumbnail_change and (arlo_wait_timeout_seconds|int > 0) }}"
+                sequence:
+                  - wait_template: >
+                      {{ (state_attr(camera_entity, 'last_thumbnail') | default('')) != _thumb_before }}
+                    timeout:
+                      seconds: "{{ arlo_wait_timeout_seconds | int }}"
+                    continue_on_timeout: true
+
+          # Save first snapshot to disk
+          - service: camera.snapshot
+            target:
+              entity_id: "{{ camera_entity }}"
+            data:
+              filename: "{{ snap1_path }}"
+
+          - variables:
+              _thumb_mid: "{{ state_attr(camera_entity, 'last_thumbnail') | default('') }}"
+
+          # Request second snapshot
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ arlo_snapshot_refresh }}"
+                sequence:
+                  - service: aarlo.camera_request_snapshot
+                    target:
+                      entity_id: "{{ camera_entity }}"
+
+          - delay:
+              seconds: "{{ arlo_delay_seconds | int }}"
+
+          # Optional: wait again
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ arlo_wait_thumbnail_change and (arlo_wait_timeout_seconds|int > 0) }}"
+                sequence:
+                  - wait_template: >
+                      {{ (state_attr(camera_entity, 'last_thumbnail') | default('')) != _thumb_mid }}
+                    timeout:
+                      seconds: "{{ arlo_wait_timeout_seconds | int }}"
+                    continue_on_timeout: true
+
+          # Save second snapshot to disk
+          - service: camera.snapshot
+            target:
+              entity_id: "{{ camera_entity }}"
+            data:
+              filename: "{{ snap2_path }}"
+
+          # Analyze using both snapshots
+          - alias: "Analyze event (Arlo dual snapshots)"
+            action: llmvision.image_analyzer
+            data:
+              image_file: |-
+                {{ snap1_path }}
+                {{ snap2_path }}
+              provider: !input provider
+              model: !input model
+              message: !input message
+              use_memory: !input use_memory
+              remember: !input remember
+              expose_images: "{{ preview_mode == 'Snapshot' or remember }}"
+              generate_title: !input remember
+              include_filename: true
+              target_width: !input target_width
+              max_tokens: !input max_tokens
+            response_variable: response
+
+    default:
+      - alias: "Analyze event (stream)"
+        action: llmvision.stream_analyzer
+        data:
+          image_entity: "{{[camera_entity]}}"
+          duration: !input duration
+          provider: !input provider
+          model: !input model
+          message: !input message
+          use_memory: !input use_memory
+          remember: !input remember
+          expose_images: "{{preview_mode == 'Snapshot' or remember}}"
+          generate_title: !input remember
+          include_filename: true
+          max_frames: !input max_frames
+          target_width: !input target_width
+          max_tokens: !input max_tokens
+        response_variable: response
+  # ─────────────────────────────────────────
+  # End of Analyze event
+  # ─────────────────────────────────────────
 
   - alias: "Update label with title"
     variables:
